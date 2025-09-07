@@ -1,0 +1,577 @@
+<?php
+/**
+ * Moja.php v2.4 - Self-Bootstrapping PHP Micro-Framework (Auto .htaccess & Folders)
+ * ============================================================================
+ * When included, this file will:
+ *   1. Check its own directory (__DIR__) for .htaccess;
+ *   2. If not found, create .htaccess (for pretty URLs) and required folders (views, data, cache, logs).
+ * 
+ * MIT License - John "Kesh" Mahugu 2025
+ */
+
+(function() {
+    $baseDir = __DIR__; // The directory where moja.php resides
+    $folders = ['views', 'data', 'cache', 'logs'];
+    $htaccessFile = $baseDir . '/.htaccess';
+    $htaccessContents = <<<HT
+# Moja.php .htaccess for pretty URLs
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php [QSA,L]
+HT;
+
+    // Create missing folders
+    foreach ($folders as $folder) {
+        $fpath = $baseDir . '/' . $folder;
+        if (!is_dir($fpath)) {
+            @mkdir($fpath, 0755, true);
+        }
+    }
+
+    // Create .htaccess if missing
+    if (!file_exists($htaccessFile)) {
+        file_put_contents($htaccessFile, $htaccessContents);
+    }
+})();
+
+// Internal: Request Object
+class MojaRequest {
+    public $params = [], $query, $body, $method, $path;
+    public function __construct() {
+        $this->query = $_GET;
+        $this->method = $_SERVER['REQUEST_METHOD'];
+        $this->body = $_POST ?: json_decode(file_get_contents('php://input'), true) ?: [];
+        $this->path = $this->detectPath();
+    }
+    private function detectPath() {
+        $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        $script = $_SERVER['SCRIPT_NAME'];
+        if (strpos($uri, $script) === 0) {
+            $route = (string)substr($uri, strlen($script));
+            if ($route === '' || $route === false) $route = '/';
+            if ($route !== '/' && str_ends_with($route, '/')) $route = rtrim($route, '/');
+        } else {
+            $route = $this->query['p'] ?? $uri;
+        }
+        return $route ?: '/';
+    }
+    public function input($key, $default = null) {
+        return $this->body[$key] ?? $this->query[$key] ?? $default;
+    }
+}
+
+// Internal: Response Object
+class MojaResponse {
+    public $status = 200, $headers = ['Content-Type' => 'text/html'], $body = '';
+    public function status($code) { $this->status = $code; return $this; }
+    public function json($data) {
+        $this->headers['Content-Type'] = 'application/json';
+        $this->body = json_encode($data);
+        return $this;
+    }
+    public function send() {
+        http_response_code($this->status);
+        foreach ($this->headers as $k => $v) header("$k: $v");
+        echo $this->body;
+    }
+}
+
+// Internal: SleekDB (Condensed, with In-Memory Fallback)
+class MojaDB {
+    private $storeName, $storePath, $filePath, $indexPath, $data = [], $dataLoaded = false;
+    private $wheres = [], $limit = null, $skip = 0, $orderBy = null, $indexes = [], $indexesLoaded = false;
+    private $inMemory = false;
+
+    public function __construct($storeName, $storePath = null) {
+        $this->storeName = $storeName;
+        $this->storePath = $storePath ? rtrim($storePath, '/') : sys_get_temp_dir();
+        $this->filePath = "$this->storePath/$storeName.json";
+        $this->indexPath = "$this->storePath/{$storeName}_indexes.json";
+        if (!$this->initDir($this->storePath)) {
+            $this->inMemory = true;
+        }
+    }
+
+    private function initDir($dir) {
+        if (is_dir($dir) && is_writable($dir)) return true;
+        return @mkdir($dir, 0755, true) && is_writable($dir);
+    }
+
+    public function insert($doc) {
+        $this->loadData();
+        $doc['_id'] = $this->generateId();
+        $this->data[] = $doc;
+        $this->updateIndexes($doc, 'insert');
+        $this->saveData();
+        return $doc;
+    }
+
+    public function insertMany($docs) {
+        $inserted = [];
+        foreach ($docs as $doc) {
+            $inserted[] = $this->insert($doc);
+        }
+        return $inserted;
+    }
+
+    public function where($field, $op, $val) {
+        $this->wheres[] = ['field' => $field, 'operator' => $op, 'value' => $val];
+        return $this;
+    }
+
+    public function limit($n) { $this->limit = $n; return $this; }
+    public function skip($n) { $this->skip = max(0, $n); return $this; }
+    public function orderBy($field, $dir = 'asc') {
+        $this->orderBy = ['field' => $field, 'direction' => strtolower($dir)];
+        return $this;
+    }
+
+    public function fetch() {
+        $this->loadData();
+        $results = $this->matches();
+        if ($this->orderBy) usort($results, fn($a, $b) => $this->compareSort($a, $b));
+        $results = array_slice($results, $this->skip, $this->limit);
+        $this->wheres = []; $this->limit = null; $this->skip = 0; $this->orderBy = null;
+        return $results;
+    }
+
+    public function update($id, $data) {
+        $this->loadData();
+        $index = array_search($id, array_column($this->data, '_id'));
+        if ($index === false) return false;
+        $oldDoc = $this->data[$index];
+        $this->data[$index] = array_merge($this->data[$index], $data);
+        $this->updateIndexes($this->data[$index], 'update', $oldDoc);
+        $this->saveData();
+        return true;
+    }
+
+    public function delete($id) {
+        $this->loadData();
+        $index = array_search($id, array_column($this->data, '_id'));
+        if ($index === false) return false;
+        $this->updateIndexes($this->data[$index], 'delete');
+        array_splice($this->data, $index, 1);
+        $this->saveData();
+        return true;
+    }
+
+    private function loadData() {
+        if ($this->dataLoaded || $this->inMemory) return;
+        $this->data = file_exists($this->filePath) ? json_decode(file_get_contents($this->filePath), true) ?: [] : [];
+        $this->dataLoaded = true;
+    }
+
+    private function saveData() {
+        if ($this->inMemory) return;
+        @file_put_contents($this->filePath, json_encode($this->data, JSON_PRETTY_PRINT), LOCK_EX);
+    }
+
+    private function loadIndexes() {
+        if ($this->indexesLoaded || $this->inMemory) return;
+        $this->indexes = file_exists($this->indexPath) ? json_decode(file_get_contents($this->indexPath), true) ?: [] : [];
+        $this->indexesLoaded = true;
+    }
+
+    private function saveIndexes() {
+        if ($this->inMemory) return;
+        @file_put_contents($this->indexPath, json_encode($this->indexes, JSON_PRETTY_PRINT), LOCK_EX);
+    }
+
+    public function createIndex($fields) {
+        $this->loadData();
+        $this->loadIndexes();
+        $key = is_array($fields) ? implode('|', $fields) : $fields;
+        if (isset($this->indexes[$key])) return;
+        $indexData = [];
+        foreach ($this->data as $doc) {
+            $val = $this->getCompositeIndexValue($doc, $fields);
+            if ($val !== null) $indexData[$val][] = $doc['_id'];
+        }
+        $this->indexes[$key] = ['fields' => (array)$fields, 'map' => $indexData];
+        $this->saveIndexes();
+    }
+
+    private function generateId() {
+        $data = random_bytes(16);
+        $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
+        $data[8] = chr(ord($data[8]) & 0x3f | 0x80);
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+    }
+
+    private function getValue($array, $key) {
+        foreach (explode('.', $key) as $k) {
+            if (!is_array($array) || !isset($array[$k])) return null;
+            $array = $array[$k];
+        }
+        return $array;
+    }
+
+    private function compare($a, $op, $b) {
+        switch ($op) {
+            case '=': return $a == $b;
+            case '!=': return $a != $b;
+            case '<': return $a < $b;
+            case '<=': return $a <= $b;
+            case '>': return $a > $b;
+            case '>=': return $a >= $b;
+            default: throw new InvalidArgumentException("Invalid operator: $op");
+        }
+    }
+
+    private function matches() {
+        $results = [];
+        foreach ($this->data as $doc) {
+            $match = true;
+            foreach ($this->wheres as $w) {
+                if (!$this->compare($this->getValue($doc, $w['field']), $w['operator'], $w['value'])) {
+                    $match = false;
+                    break;
+                }
+            }
+            if ($match) $results[] = $doc;
+        }
+        return $results;
+    }
+
+    private function compareSort($a, $b) {
+        $valA = $this->getValue($a, $this->orderBy['field']);
+        $valB = $this->getValue($b, $this->orderBy['field']);
+        $dir = $this->orderBy['direction'] === 'asc' ? 1 : -1;
+        return ($valA <=> $valB) * $dir;
+    }
+
+    private function updateIndexes($doc, $op, $oldDoc = null) {
+        $this->loadIndexes();
+        foreach ($this->indexes as &$index) {
+            if ($op === 'insert') {
+                $key = $this->getCompositeIndexValue($doc, $index['fields']);
+                if ($key !== null) $index['map'][$key][] = $doc['_id'];
+            } elseif ($op === 'update') {
+                $oldKey = $this->getCompositeIndexValue($oldDoc, $index['fields']);
+                $newKey = $this->getCompositeIndexValue($doc, $index['fields']);
+                if ($oldKey !== $newKey) {
+                    if ($oldKey && isset($index['map'][$oldKey])) {
+                        $index['map'][$oldKey] = array_filter($index['map'][$oldKey], fn($id) => $id !== $doc['_id']);
+                        if (empty($index['map'][$oldKey])) unset($index['map'][$oldKey]);
+                    }
+                    if ($newKey) $index['map'][$newKey][] = $doc['_id'];
+                }
+            } elseif ($op === 'delete') {
+                $key = $this->getCompositeIndexValue($doc, $index['fields']);
+                if ($key && isset($index['map'][$key])) {
+                    $index['map'][$key] = array_filter($index['map'][$key], fn($id) => $id !== $doc['_id']);
+                    if (empty($index['map'][$key])) unset($index['map'][$key]);
+                }
+            }
+        }
+        $this->saveIndexes();
+    }
+
+    private function getCompositeIndexValue($doc, $fields) {
+        $values = [];
+        foreach ((array)$fields as $f) {
+            $val = $this->getValue($doc, $f);
+            if ($val === null) return null;
+            $values[] = is_scalar($val) ? (string)$val : json_encode($val);
+        }
+        return implode('|', $values);
+    }
+}
+
+// Internal: Jnja Templating (Condensed, with String Rendering)
+class MojaTemplate {
+    private $templateDir, $cacheDir, $autoEscape;
+
+    public function __construct($templateDir = null, $cacheDir = null, $autoEscape = true) {
+        $this->templateDir = $templateDir ? rtrim($templateDir, '/') . '/' : sys_get_temp_dir() . '/';
+        $this->cacheDir = $cacheDir ? rtrim($cacheDir, '/') . '/' : sys_get_temp_dir() . '/';
+        $this->autoEscape = $autoEscape;
+        $this->initDir($this->templateDir);
+        $this->initDir($this->cacheDir);
+    }
+
+    private function initDir($dir) {
+        if (!$dir || $dir === sys_get_temp_dir() . '/') return true;
+        if (is_dir($dir) && is_writable($dir)) return true;
+        return @mkdir($dir, 0755, true) && is_writable($dir);
+    }
+
+    public function render($template, $vars = []) {
+        $compiled = $this->compile($template);
+        extract($vars, EXTR_SKIP);
+        ob_start();
+        include $compiled;
+        return ob_get_clean();
+    }
+
+    public function renderString($source, $vars = []) {
+        $compiled = $this->parse($source, 'string');
+        $tmpFile = $this->cacheDir . 'moja_string_' . md5($source) . '.php';
+        file_put_contents($tmpFile, $compiled);
+        extract($vars, EXTR_SKIP);
+        ob_start();
+        include $tmpFile;
+        return ob_get_clean();
+    }
+
+    private function compile($template) {
+        $path = $this->templateDir . $template;
+        if (!is_readable($path)) {
+            Moja::log("Template not found: $path; falling back to empty string");
+            return $this->parse('', $template);
+        }
+        $cacheFile = $this->cacheDir . str_replace(['/', '\\'], '_', $template) . '.php';
+        if (!file_exists($cacheFile) || filemtime($path) > filemtime($cacheFile)) {
+            $source = file_get_contents($path);
+            file_put_contents($cacheFile, $this->parse($source, $template));
+        }
+        return $cacheFile;
+    }
+
+    private function parse($source, $path) {
+        if (preg_match('/\{\%\s*extends\s+[\'"](.+?)[\'"]\s*\%\}/', $source, $m)) {
+            $parent = $m[1];
+            $source = preg_replace('/\{\%\s*extends\s+[\'"].+?[\'"]\s*\%\}/', '', $source);
+            $childBlocks = $this->parseBlocks($source);
+            $parentSource = isset($GLOBALS['moja_templates'][$parent]) ? $GLOBALS['moja_templates'][$parent] : (
+                is_readable($this->templateDir . $parent) ? file_get_contents($this->templateDir . $parent) : ''
+            );
+            $parentPhp = $this->parse($parentSource, $parent);
+            foreach ($childBlocks as $name => $content) {
+                $parentPhp = preg_replace('/\{\%\s*block\s+' . preg_quote($name, '/') . '\s*\%\}(.*?)\{\%\s*endblock\s*\%\}/s', $content, $parentPhp);
+            }
+            return $parentPhp;
+        }
+        $source = $this->replaceBlocks($source);
+        $source = $this->replaceVars($source);
+        return "<?php\n?>\n$source";
+    }
+
+    private function parseBlocks($source) {
+        $blocks = [];
+        preg_match_all('/\{\%\s*block\s+(\w+)\s*\%\}(.*?)\{\%\s*endblock\s*\%\}/s', $source, $m, PREG_SET_ORDER);
+        foreach ($m as $match) $blocks[$match[1]] = $this->replaceVars($match[2]);
+        return $blocks;
+    }
+
+    private function replaceBlocks($source) {
+        return preg_replace_callback('/\{\%\s*block\s+(\w+)\s*\%\}(.*?)\{\%\s*endblock\s*\%\}/s', fn($m) => $m[2], $source);
+    }
+
+    private function replaceVars($source) {
+        $esc = $this->autoEscape ? 'htmlspecialchars' : 'strval';
+        return preg_replace_callback('/\{\{\s*(.+?)\s*\}\}/', function($m) use ($esc) {
+            $var = $this->parseVar(trim($m[1]));
+            return "<?php echo $esc($var); ?>";
+        }, $source);
+    }
+
+    private function parseVar($var) {
+        $parts = explode('.', $var);
+        $php = '$' . array_shift($parts);
+        foreach ($parts as $p) $php .= is_numeric($p) ? "[$p]" : "['$p']";
+        return $php;
+    }
+}
+
+// Internal: Auth with JWT
+class MojaAuth {
+    private $db, $secret = 'moja_secret_2025';
+    public function __construct() {
+        $this->db = Moja::db('users');
+        $this->db->createIndex('username');
+    }
+    public function login($username, $password) {
+        $user = $this->db->where('username', '=', $username)->fetch();
+        if ($user && password_verify($password, $user[0]['password'] ?? '')) {
+            $_SESSION['user_id'] = $user[0]['_id'];
+            $_SESSION['user_role'] = $user[0]['role'] ?? 'user';
+            $_SESSION['jwt'] = $this->generateJwt($user[0]);
+            return true;
+        }
+        return false;
+    }
+    public function register($username, $password, $email, $role = 'user') {
+        return $this->db->insert([
+            'username' => $username,
+            'password' => password_hash($password, PASSWORD_DEFAULT),
+            'email' => $email,
+            'role' => $role
+        ]);
+    }
+    public function check($role = null) {
+        if (!isset($_SESSION['user_id'], $_SESSION['jwt'])) return false;
+        $jwt = $this->verifyJwt($_SESSION['jwt']);
+        if (!$jwt || $jwt['user_id'] !== $_SESSION['user_id']) return false;
+        if ($role && $_SESSION['user_role'] !== $role) return false;
+        return true;
+    }
+    public function user() {
+        if (!$this->check()) return null;
+        return $this->db->where('_id', '=', $_SESSION['user_id'])->fetch()[0] ?? null;
+    }
+    public function logout() {
+        unset($_SESSION['user_id'], $_SESSION['user_role'], $_SESSION['jwt']);
+    }
+    private function generateJwt($user) {
+        $header = base64_encode(json_encode(['alg' => 'HS256', 'typ' => 'JWT']));
+        $payload = base64_encode(json_encode([
+            'user_id' => $user['_id'],
+            'role' => $user['role'],
+            'exp' => time() + 3600
+        ]));
+        $sig = hash_hmac('sha256', "$header.$payload", $this->secret, true);
+        return "$header.$payload." . base64_encode($sig);
+    }
+    private function verifyJwt($jwt) {
+        $parts = explode('.', $jwt);
+        if (count($parts) !== 3) return false;
+        [$header, $payload, $sig] = $parts;
+        $expectedSig = hash_hmac('sha256', "$header.$payload", $this->secret, true);
+        if (base64_encode($expectedSig) !== $sig) return false;
+        $data = json_decode(base64_decode($payload), true);
+        if ($data['exp'] < time()) return false;
+        return $data;
+    }
+}
+
+// Moja Framework Core
+class Moja {
+    private static $instance;
+    private $config = [
+        'view_dir' => __DIR__.'/views',
+        'cache_dir' => __DIR__.'/cache',
+        'db_dir' => __DIR__.'/data',
+        'auto_escape' => true,
+        'spa' => false,
+        'log_dir' => __DIR__.'/logs',
+        'debug' => false
+    ];
+    private $router, $template, $hooks = [], $dbs = [], $auth;
+
+    private function __construct() {
+        $this->router = new class {
+            private $routes = [], $mws = [];
+            public function get($path, $fn) { $this->routes['GET'][$path] = $fn; }
+            public function post($path, $fn) { $this->routes['POST'][$path] = $fn; }
+            public function mw($fn) { $this->mws[] = $fn; }
+            public function dispatch($req, $res) {
+                $uri = $req->path;
+                $method = $req->method;
+                foreach ($this->mws as $mw) {
+                    if (call_user_func($mw, $req, $res) === false) {
+                        $res->status(403)->json(['error' => 'Forbidden'])->send();
+                        return;
+                    }
+                }
+                foreach ($this->routes[$method] ?? [] as $route => $fn) {
+                    $pattern = preg_replace('#\{([^/]+)\}#', '(?P<\1>[^/]+)', $route);
+                    if (preg_match("#^$pattern$#", $uri, $m)) {
+                        $req->params = array_filter($m, 'is_string', ARRAY_FILTER_USE_KEY);
+                        $out = call_user_func($fn, $req, $res);
+                        if (is_string($out)) $res->body = $out;
+                        elseif (is_array($out)) $res->json($out);
+                        $res->send();
+                        return;
+                    }
+                }
+                $res->status(404)->json(['error' => 'Not Found'])->send();
+            }
+        };
+        session_start();
+        // Always initialize the template engine!
+        $this->template = new MojaTemplate(
+            $this->config['view_dir'],
+            $this->config['cache_dir'],
+            $this->config['auto_escape']
+        );
+        // Default welcome route
+        $this->router->get('/', fn($req, $res) => Moja::view_string(
+            '<h1>Welcome to Moja.php!</h1><p>Lightweight PHP micro-framework by John "Kesh" Mahugu.</p>',
+            []
+        ));
+    }
+
+    public static function instance() {
+        return self::$instance ??= new self();
+    }
+
+    public static function view_dir($dir) { return self::config(['view_dir' => $dir]); }
+    public static function cache_dir($dir) { return self::config(['cache_dir' => $dir]); }
+    public static function db_dir($dir) { return self::config(['db_dir' => $dir]); }
+    public static function config($cfg = []) {
+        $i = self::instance();
+        $i->config = array_merge($i->config, $cfg);
+        $i->template = new MojaTemplate($i->config['view_dir'], $i->config['cache_dir'], $i->config['auto_escape']);
+        return $i->config;
+    }
+
+    public static function get($path, $fn) { self::instance()->router->get($path, $fn); }
+    public static function post($path, $fn) { self::instance()->router->post($path, $fn); }
+    public static function mw($fn) { self::instance()->router->mw($fn); }
+
+    public static function db($store) {
+        $i = self::instance();
+        return $i->dbs[$store] ??= new MojaDB($store, $i->config['db_dir']);
+    }
+
+    public static function view($tpl, $data = []) {
+        $i = self::instance();
+        $i->trigger('before_view', [$tpl, &$data]);
+        $out = $i->config['spa'] || isset($_GET['json']) ? json_encode($data) : $i->template->render($tpl, $data);
+        $i->trigger('after_view', [&$out]);
+        return $out;
+    }
+
+    public static function view_string($tplString, $data = []) {
+        $i = self::instance();
+        $i->trigger('before_view', ['string', &$data]);
+        $out = $i->config['spa'] || isset($_GET['json']) ? json_encode($data) : $i->template->renderString($tplString, $data);
+        $i->trigger('after_view', [&$out]);
+        return $out;
+    }
+
+    public static function run() {
+        $i = self::instance();
+        $req = new MojaRequest();
+        $res = new MojaResponse();
+        $i->trigger('before_run', [$req, $res]);
+        $i->router->dispatch($req, $res);
+        $i->trigger('after_run', [$req, $res]);
+    }
+
+    public static function extend($name, $fn) {
+        $i = self::instance();
+        $i->trigger('before_extend', [$name]);
+        call_user_func($fn, $i);
+        $i->trigger('after_extend', [$name]);
+    }
+
+    public static function hook($event, $fn) { self::instance()->hooks[$event][] = $fn; }
+
+    private function trigger($event, $args = []) {
+        foreach ($this->hooks[$event] ?? [] as $fn) call_user_func_array($fn, $args);
+    }
+
+    public static function auth() { return self::instance()->auth ??= new MojaAuth(); }
+
+    public static function log($msg) {
+        $i = self::instance();
+        $logDir = $i->config['log_dir'] ?? sys_get_temp_dir();
+        if ($i->initDir($logDir)) {
+            file_put_contents("$logDir/app.log", date('Y-m-d H:i:s') . " - $msg\n", FILE_APPEND);
+        } else {
+            error_log("Moja: $msg");
+        }
+        if ($i->config['debug']) echo "<pre>Log: $msg</pre>";
+    }
+
+    private function initDir($dir) {
+        if (!$dir) return false;
+        if (is_dir($dir) && is_writable($dir)) return true;
+        return @mkdir($dir, 0755, true) && is_writable($dir);
+    }
+}
+?>
